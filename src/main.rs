@@ -1,8 +1,9 @@
-//! mail-mcp: Secure IMAP MCP server over stdio
+//! mail-mcp: Secure IMAP MCP server over stdio or streamable HTTP
 //!
 //! This server provides read/write access to IMAP mailboxes via the Model
-//! Context Protocol (MCP) over stdio. It features cursor-based pagination,
-//! TLS-only connections, and security-first design.
+//! Context Protocol (MCP). It serves over stdio by default, or over a
+//! streamable-HTTP endpoint when `MAIL_MCP_TRANSPORT=http`. It features
+//! cursor-based pagination, TLS-only connections, and security-first design.
 //!
 //! # Architecture
 //!
@@ -31,17 +32,35 @@ mod smtp;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use config::ServerConfig;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpService, session::local::LocalSessionManager,
+};
 use tracing_subscriber::EnvFilter;
+
+/// Default bind address for the streamable-HTTP transport.
+const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8080";
+/// Default mount path for the streamable-HTTP transport.
+const DEFAULT_HTTP_PATH: &str = "/mcp";
+
+/// Selected transport for the MCP server, resolved from the environment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TransportMode {
+    /// Serve over stdio (default; spawned by an MCP client).
+    Stdio,
+    /// Serve over streamable HTTP on `addr`, mounted at `path`.
+    Http { addr: String, path: String },
+}
 
 /// Application entry point
 ///
-/// Initializes tracing from environment, loads config, and serves the MCP
-/// server over stdio. This process expects to be spawned by an MCP client
-/// via `stdio` transport.
+/// Initializes tracing from environment, loads config, resolves the transport
+/// (`MAIL_MCP_TRANSPORT`), and serves the MCP server over stdio (default; the
+/// process is spawned by an MCP client) or a streamable-HTTP endpoint.
 ///
 /// # Environment Variables
 ///
@@ -73,13 +92,93 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_writer(std::io::stderr)
         .init();
 
-    tracing::info!("starting MCP server transport=Stdio");
+    let env_map: BTreeMap<String, String> = std::env::vars().collect();
+    let transport = match resolve_transport(&env_map) {
+        Ok(transport) => transport,
+        Err(err) => {
+            eprintln!("mail-mcp: {err}");
+            std::process::exit(2);
+        }
+    };
+
     let config = ServerConfig::load_from_env()?;
     let update_notice = check_for_updates().await;
-    let service = server::MailImapServer::new(config, update_notice)
-        .serve(stdio())
-        .await?;
-    service.waiting().await?;
+
+    match transport {
+        TransportMode::Stdio => {
+            tracing::info!("starting MCP server transport=Stdio");
+            let service = server::MailImapServer::new(config, update_notice)
+                .serve(stdio())
+                .await?;
+            service.waiting().await?;
+        }
+        TransportMode::Http { addr, path } => {
+            serve_http(config, update_notice, &addr, &path).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve the transport from the environment.
+///
+/// `MAIL_MCP_TRANSPORT` selects the transport (`stdio` (default) or `http`).
+/// For `http`, `MAIL_MCP_HTTP_ADDR` (default `127.0.0.1:8080`) and
+/// `MAIL_MCP_HTTP_PATH` (default `/mcp`) configure the listener. An unknown
+/// transport value is a hard error.
+fn resolve_transport(env_map: &BTreeMap<String, String>) -> Result<TransportMode, String> {
+    let mode = env_map
+        .get("MAIL_MCP_TRANSPORT")
+        .map(|value| value.trim().to_ascii_lowercase());
+    match mode.as_deref() {
+        None | Some("") | Some("stdio") => Ok(TransportMode::Stdio),
+        Some("http") => {
+            let addr = env_lookup(env_map, "MAIL_MCP_HTTP_ADDR", DEFAULT_HTTP_ADDR);
+            let path = env_lookup(env_map, "MAIL_MCP_HTTP_PATH", DEFAULT_HTTP_PATH);
+            Ok(TransportMode::Http { addr, path })
+        }
+        Some(other) => Err(format!(
+            "unknown MAIL_MCP_TRANSPORT '{other}' (expected 'stdio' or 'http')"
+        )),
+    }
+}
+
+/// Fetch a trimmed, non-empty env value, falling back to `default`.
+fn env_lookup(env_map: &BTreeMap<String, String>, key: &str, default: &str) -> String {
+    env_map
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(default)
+        .to_owned()
+}
+
+/// Serve the MCP server over streamable HTTP.
+///
+/// Each MCP session gets its own [`server::MailImapServer`] instance via the
+/// service factory (the server is cheap to construct — it holds `Arc`-wrapped
+/// shared state). Sessions are tracked by an in-memory [`LocalSessionManager`].
+async fn serve_http(
+    config: ServerConfig,
+    update_notice: Option<String>,
+    addr: &str,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(server::MailImapServer::new(
+                config.clone(),
+                update_notice.clone(),
+            ))
+        },
+        Arc::new(LocalSessionManager::default()),
+        Default::default(),
+    );
+
+    let router = axum::Router::new().nest_service(path, service);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let bound = listener.local_addr()?;
+    tracing::info!("starting MCP server transport=Http addr={bound} path={path}");
+    axum::serve(listener, router).await?;
     Ok(())
 }
 
@@ -160,6 +259,14 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("Usage:\n");
     out.push_str("  mail-mcp\n");
     out.push_str("  mail-mcp --help\n\n");
+
+    out.push_str("Transport selection\n");
+    out.push_str("  MAIL_MCP_TRANSPORT   (stdio | http, default: stdio)\n");
+    out.push_str("  MAIL_MCP_HTTP_ADDR   (http only, default: 127.0.0.1:8080)\n");
+    out.push_str("  MAIL_MCP_HTTP_PATH   (http only, default: /mcp)\n");
+    out.push_str(
+        "  stdio is spawned by an MCP client; http serves the streamable-HTTP endpoint.\n\n",
+    );
 
     out.push_str("IMAP environment setup\n");
     out.push_str("  Required per account section MAIL_IMAP_<ACCOUNT>_:\n");
@@ -348,9 +455,20 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        build_help_output, discover_account_sections, is_secret_key, redact_value,
+        DEFAULT_HTTP_ADDR, DEFAULT_HTTP_PATH, TransportMode, build_help_output,
+        discover_account_sections, env_lookup, is_secret_key, redact_value, resolve_transport,
         should_print_help,
     };
+
+    #[test]
+    fn env_lookup_trims_and_falls_back_on_blank_or_missing() {
+        let mut env_map = BTreeMap::new();
+        assert_eq!(env_lookup(&env_map, "K", "def"), "def");
+        env_map.insert("K".to_owned(), "   ".to_owned());
+        assert_eq!(env_lookup(&env_map, "K", "def"), "def");
+        env_map.insert("K".to_owned(), "  value  ".to_owned());
+        assert_eq!(env_lookup(&env_map, "K", "def"), "value");
+    }
 
     #[test]
     fn detects_short_and_long_help_flags() {
@@ -395,6 +513,63 @@ mod tests {
         assert!(is_secret_key("mail_imap_default_pass"));
         assert!(is_secret_key("MAIL_IMAP_API_TOKEN"));
         assert!(!is_secret_key("MAIL_IMAP_DEFAULT_HOST"));
+    }
+
+    #[test]
+    fn transport_defaults_to_stdio_when_unset_or_blank() {
+        assert_eq!(
+            resolve_transport(&BTreeMap::new()).unwrap(),
+            TransportMode::Stdio
+        );
+        let mut env_map = BTreeMap::new();
+        env_map.insert("MAIL_MCP_TRANSPORT".to_owned(), "  ".to_owned());
+        assert_eq!(resolve_transport(&env_map).unwrap(), TransportMode::Stdio);
+    }
+
+    #[test]
+    fn transport_http_uses_defaults_and_is_case_insensitive() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("MAIL_MCP_TRANSPORT".to_owned(), "  HTTP ".to_owned());
+        assert_eq!(
+            resolve_transport(&env_map).unwrap(),
+            TransportMode::Http {
+                addr: DEFAULT_HTTP_ADDR.to_owned(),
+                path: DEFAULT_HTTP_PATH.to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn transport_http_honors_addr_and_path_overrides() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("MAIL_MCP_TRANSPORT".to_owned(), "http".to_owned());
+        env_map.insert("MAIL_MCP_HTTP_ADDR".to_owned(), "0.0.0.0:9000".to_owned());
+        env_map.insert("MAIL_MCP_HTTP_PATH".to_owned(), "/imap".to_owned());
+        assert_eq!(
+            resolve_transport(&env_map).unwrap(),
+            TransportMode::Http {
+                addr: "0.0.0.0:9000".to_owned(),
+                path: "/imap".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn transport_rejects_unknown_value() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("MAIL_MCP_TRANSPORT".to_owned(), "grpc".to_owned());
+        let err = resolve_transport(&env_map).unwrap_err();
+        assert!(err.contains("grpc"));
+        assert!(err.contains("stdio"));
+        assert!(err.contains("http"));
+    }
+
+    #[test]
+    fn help_output_includes_transport_section() {
+        let help = build_help_output(&BTreeMap::new());
+        assert!(help.contains("Transport selection"));
+        assert!(help.contains("MAIL_MCP_TRANSPORT"));
+        assert!(help.contains("MAIL_MCP_HTTP_ADDR"));
     }
 
     #[test]
