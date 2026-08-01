@@ -390,10 +390,11 @@ Filename and MIME type are auto-detected from the file path. Reply with `include
 
 **Downloading** an attachment from a received message: use `imap_get_attachment`
 with the `message_id` and a `part_id` (from `imap_get_message`) or `filename`.
-It writes the decoded file to disk and returns the path — no size cap, and the
-binary stays out of the response. Set the default download directory with
+It writes the decoded file to disk and returns the path, keeping the binary out
+of the response. Set the default download directory with
 `MAIL_ATTACHMENT_DOWNLOAD_DIR` (falls back to the system temp dir), or pass
-`output_dir` per call.
+`output_dir` per call. A caller-supplied `output_dir` must fall under
+`MAIL_ATTACHMENT_ALLOWED_DIRS` (which defaults to the download dir).
 
 ### Bulk Operations (2 tools)
 
@@ -443,9 +444,11 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 - **TLS enforced** on all connections (except localhost proxies)
 - **Passwords in SecretString** — never logged or returned in responses
 - **Write operations gated** — require explicit `MAIL_IMAP_WRITE_ENABLED=true`
-- **Send operations gated** — require explicit `MAIL_SMTP_WRITE_ENABLED=true`
+- **Send operations gated** — SMTP, EWS, **and Graph** sends all require explicit `MAIL_SMTP_WRITE_ENABLED=true`
+- **Attachment paths restricted** — `file_path` attachments and download `output_dir`s are confined to `MAIL_ATTACHMENT_ALLOWED_DIRS` (defaults to the download dir), with a total-size cap — a prompt-injected model cannot read and exfiltrate arbitrary local files
 - **Delete confirmation** — requires `confirm: true`
 - **HTML sanitized** with ammonia (prevents XSS)
+- **MIME depth-bounded** — deeply nested multipart messages are rejected rather than overflowing the stack
 - **Bounded outputs** — body text, HTML, attachments truncated to configurable limits
 - **OAuth2 tokens cached** with 10-minute refresh margin
 - **No secrets in responses** — credentials never exposed via MCP tools
@@ -517,6 +520,9 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 | `MAIL_IMAP_CONNECT_TIMEOUT_MS` | 30000 | TCP connection timeout |
 | `MAIL_IMAP_GREETING_TIMEOUT_MS` | 15000 | TLS/greeting timeout |
 | `MAIL_IMAP_SOCKET_TIMEOUT_MS` | 300000 | Socket I/O timeout |
+| `MAIL_ATTACHMENT_DOWNLOAD_DIR` | _(system temp dir)_ | Default directory for `imap_get_attachment` downloads |
+| `MAIL_ATTACHMENT_ALLOWED_DIRS` | _(the download dir)_ | `:`-separated directories that outgoing-mail `file_path` attachments may be read from, and that a caller-supplied download `output_dir` must fall under. Prevents a prompt-injected model from attaching arbitrary local files (e.g. `~/.ssh/id_rsa`, `.env`). |
+| `MAIL_ATTACHMENT_MAX_BYTES` | 25000000 | Maximum total size of all attachments on one outgoing message |
 
 </details>
 

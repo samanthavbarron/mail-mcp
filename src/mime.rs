@@ -11,6 +11,50 @@ use mailparse::{DispositionType, MailHeader, ParsedMail};
 use crate::errors::{AppError, AppResult};
 use crate::models::AttachmentInfo;
 
+/// Maximum MIME nesting depth for our own recursive traversal. Real messages
+/// nest only a few levels; this bounds `walk_parts`/`walk_attachment_parts`.
+const MAX_MIME_DEPTH: usize = 100;
+
+/// Maximum number of `multipart/` declarations permitted in a raw message.
+///
+/// `mailparse::parse_mail` recurses eagerly over the multipart tree *before*
+/// our own traversal runs, so a deeply nested message can overflow the stack
+/// inside the parser itself — a post-parse depth cap is too late. MIME nesting
+/// depth is bounded by the number of multipart parts (each level requires one
+/// `Content-Type: multipart/*` header), so rejecting messages with too many
+/// multipart declarations *before* parsing bounds the parser's recursion.
+/// 256 is far above any legitimate message yet well under the ~1000-deep
+/// overflow threshold on a 2 MiB worker stack.
+const MAX_MULTIPART_PARTS: usize = 256;
+
+/// Reject a raw message whose multipart nesting could overflow the stack during
+/// `mailparse::parse_mail`. MUST be called before parsing untrusted message
+/// bytes.
+///
+/// Counts `multipart/` occurrences (ASCII case-insensitive) — an upper bound on
+/// nesting depth, since that is the only construct `mailparse` recurses into.
+/// Occurrences in body text only make the check stricter, never weaker.
+///
+/// # Errors
+///
+/// - `Internal` if more than [`MAX_MULTIPART_PARTS`] multipart declarations are present.
+pub fn guard_mime_nesting(raw: &[u8]) -> AppResult<()> {
+    const NEEDLE: &[u8] = b"multipart/";
+    let mut count = 0usize;
+    for window in raw.windows(NEEDLE.len()) {
+        if window.eq_ignore_ascii_case(NEEDLE) {
+            count += 1;
+            if count > MAX_MULTIPART_PARTS {
+                return Err(AppError::Internal(format!(
+                    "message declares more than {MAX_MULTIPART_PARTS} multipart parts; \
+                     refusing to parse (possible MIME nesting attack)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Parsed message representation
 ///
 /// Contains extracted headers, body content, and attachment metadata.
@@ -60,6 +104,7 @@ pub fn parse_message(
     extract_attachment_text: bool,
     attachment_text_max_chars: usize,
 ) -> AppResult<ParsedMessage> {
+    guard_mime_nesting(raw)?;
     let parsed = mailparse::parse_mail(raw)
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
 
@@ -76,6 +121,7 @@ pub fn parse_message(
         &mut attachments,
         extract_attachment_text,
         attachment_text_max_chars,
+        0,
     )?;
 
     let text = body_text.map(|t| truncate_chars(t, body_max_chars));
@@ -103,6 +149,7 @@ pub fn parse_message(
 ///
 /// Traverses all MIME parts to extract text/plain, text/html bodies,
 /// and attachment metadata. Handles multipart structures correctly.
+#[allow(clippy::too_many_arguments)]
 fn walk_parts(
     part: &ParsedMail<'_>,
     part_id: String,
@@ -111,7 +158,13 @@ fn walk_parts(
     attachments: &mut Vec<AttachmentInfo>,
     extract_attachment_text: bool,
     attachment_text_max_chars: usize,
+    depth: usize,
 ) -> AppResult<()> {
+    if depth > MAX_MIME_DEPTH {
+        return Err(AppError::Internal(format!(
+            "MIME structure nested deeper than {MAX_MIME_DEPTH} levels; refusing to parse"
+        )));
+    }
     if part.subparts.is_empty() {
         let ctype = part.ctype.mimetype.to_ascii_lowercase();
         let disp = part.get_content_disposition();
@@ -139,12 +192,16 @@ fn walk_parts(
                 .get_body_raw()
                 .map_err(|e| AppError::Internal(format!("failed decoding attachment body: {e}")))?;
             let mut extracted_text = None;
-            if extract_attachment_text
-                && ctype == "application/pdf"
-                && raw_body.len() <= 5_000_000
-                && let Ok(text) = pdf_extract::extract_text_from_mem(&raw_body)
+            if extract_attachment_text && ctype == "application/pdf" && raw_body.len() <= 5_000_000
             {
-                extracted_text = Some(truncate_chars(text, attachment_text_max_chars));
+                // pdf-extract can panic on malformed input; isolate it so a
+                // crafted PDF attachment can't abort the whole request.
+                let parsed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    pdf_extract::extract_text_from_mem(&raw_body)
+                }));
+                if let Ok(Ok(text)) = parsed {
+                    extracted_text = Some(truncate_chars(text, attachment_text_max_chars));
+                }
             }
 
             attachments.push(AttachmentInfo {
@@ -169,6 +226,7 @@ fn walk_parts(
             attachments,
             extract_attachment_text,
             attachment_text_max_chars,
+            depth + 1,
         )?;
     }
     Ok(())
@@ -217,10 +275,11 @@ pub struct ExtractedAttachment {
 ///
 /// - `Internal` if `mailparse` fails or an attachment body cannot be decoded
 pub fn collect_attachments(raw: &[u8]) -> AppResult<Vec<ExtractedAttachment>> {
+    guard_mime_nesting(raw)?;
     let parsed = mailparse::parse_mail(raw)
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
     let mut out = Vec::new();
-    walk_attachment_parts(&parsed, "1".to_owned(), &mut out)?;
+    walk_attachment_parts(&parsed, "1".to_owned(), &mut out, 0)?;
     Ok(out)
 }
 
@@ -232,7 +291,13 @@ fn walk_attachment_parts(
     part: &ParsedMail<'_>,
     part_id: String,
     out: &mut Vec<ExtractedAttachment>,
+    depth: usize,
 ) -> AppResult<()> {
+    if depth > MAX_MIME_DEPTH {
+        return Err(AppError::Internal(format!(
+            "MIME structure nested deeper than {MAX_MIME_DEPTH} levels; refusing to parse"
+        )));
+    }
     if part.subparts.is_empty() {
         let ctype = part.ctype.mimetype.to_ascii_lowercase();
         let disp = part.get_content_disposition();
@@ -255,7 +320,7 @@ fn walk_attachment_parts(
 
     for (idx, sub) in part.subparts.iter().enumerate() {
         let next_id = format!("{part_id}.{}", idx + 1);
-        walk_attachment_parts(sub, next_id, out)?;
+        walk_attachment_parts(sub, next_id, out, depth + 1)?;
     }
     Ok(())
 }
@@ -409,5 +474,61 @@ mod tests {
         assert_eq!(att.bytes, b"hello world");
         // The part_id from collect_attachments lines up with parse_message's.
         assert_eq!(att.part_id, meta_part_id);
+    }
+
+    /// The pre-parse guard counts multipart declarations and rejects an
+    /// excessive number, case-insensitively.
+    #[test]
+    fn guard_mime_nesting_rejects_excess_multiparts() {
+        use super::guard_mime_nesting;
+
+        // A couple of multipart declarations is normal.
+        let ok = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n\
+                   Content-Type: multipart/alternative; boundary=y\r\n";
+        assert!(guard_mime_nesting(ok).is_ok());
+
+        // Well over the cap, in either case, is rejected.
+        let many_lower = "Content-Type: multipart/mixed; boundary=b\r\n".repeat(300);
+        assert!(guard_mime_nesting(many_lower.as_bytes()).is_err());
+        let many_upper = "CONTENT-TYPE: MULTIPART/MIXED; boundary=b\r\n".repeat(300);
+        assert!(guard_mime_nesting(many_upper.as_bytes()).is_err());
+    }
+
+    /// A message nested deep enough to overflow the parser's own stack must be
+    /// rejected BEFORE `mailparse::parse_mail` recurses. Without the pre-parse
+    /// guard this test aborts the process with a stack overflow — so it is a
+    /// genuine regression guard for that fix, not just the post-parse cap.
+    #[test]
+    fn deeply_nested_multipart_is_rejected_before_parsing() {
+        use super::collect_attachments;
+
+        // Build ~2000 nested multipart levels in O(n): all opening headers,
+        // a body, then all closing boundaries.
+        let depth = 2000;
+        let mut raw = String::from(
+            "From: a@example.com\r\nTo: b@example.com\r\nSubject: nested\r\nMIME-Version: 1.0\r\n",
+        );
+        for i in 0..depth {
+            raw.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=\"b{i}\"\r\n\r\n--b{i}\r\n"
+            ));
+        }
+        raw.push_str("deepest body\r\n");
+        for i in (0..depth).rev() {
+            raw.push_str(&format!("--b{i}--\r\n"));
+        }
+        let raw = raw.as_bytes();
+
+        assert!(parse_message(raw, 2000, true, false, 10000).is_err());
+        assert!(collect_attachments(raw).is_err());
+    }
+
+    /// A normal, shallow message still parses fine (the depth cap doesn't
+    /// regress ordinary mail).
+    #[test]
+    fn shallow_multipart_still_parses() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: ok\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=BND\r\n\r\n--BND\r\nContent-Type: text/plain\r\n\r\nhello\r\n--BND--\r\n";
+        let parsed = parse_message(raw, 2000, true, false, 10000).expect("parse ok");
+        assert_eq!(parsed.body_text.as_deref(), Some("hello"));
     }
 }

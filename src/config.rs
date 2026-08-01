@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::env::VarError;
+use std::path::PathBuf;
 
 use regex::Regex;
 use secrecy::SecretString;
@@ -105,6 +106,20 @@ pub struct ServerConfig {
     /// attachments. `None` = fall back to the system temp dir. A per-call
     /// `output_dir` argument overrides this.
     pub attachment_download_dir: Option<String>,
+    /// Directories from which outgoing-mail attachments may be read (via a
+    /// send tool's `file_path`) and to which downloaded attachments may be
+    /// written (via a caller-supplied `output_dir`).
+    ///
+    /// Set from `MAIL_ATTACHMENT_ALLOWED_DIRS` (`:`-separated). When unset it
+    /// defaults to a single entry: `attachment_download_dir`, or the system
+    /// temp dir if that is also unset. This prevents a prompt-injected model
+    /// from attaching arbitrary local files (e.g. `~/.ssh/id_rsa`, `.env`) to
+    /// an outgoing message.
+    pub attachment_allowed_dirs: Vec<PathBuf>,
+    /// Maximum total size, in bytes, of all attachments on a single outgoing
+    /// message. Bounds memory use when reading files from disk. Set from
+    /// `MAIL_ATTACHMENT_MAX_BYTES` (default 25 MB).
+    pub attachment_max_bytes: u64,
 }
 
 impl ServerConfig {
@@ -163,6 +178,12 @@ impl ServerConfig {
         let (ews_accounts, ews_oauth2_accounts) = load_ews_accounts()?;
         let smtp_accounts = load_smtp_accounts(&oauth2_accounts)?;
 
+        let attachment_download_dir = env::var("MAIL_ATTACHMENT_DOWNLOAD_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+        let attachment_allowed_dirs = resolve_attachment_allowed_dirs(&attachment_download_dir);
+        let attachment_max_bytes = parse_u64_env("MAIL_ATTACHMENT_MAX_BYTES", 25_000_000)?;
+
         Ok(Self {
             accounts,
             oauth2_accounts,
@@ -185,9 +206,9 @@ impl ServerConfig {
             socket_timeout_ms: parse_u64_env("MAIL_IMAP_SOCKET_TIMEOUT_MS", 300_000)?,
             cursor_ttl_seconds: parse_u64_env("MAIL_IMAP_CURSOR_TTL_SECONDS", 600)?,
             cursor_max_entries: parse_usize_env("MAIL_IMAP_CURSOR_MAX_ENTRIES", 512)?,
-            attachment_download_dir: env::var("MAIL_ATTACHMENT_DOWNLOAD_DIR")
-                .ok()
-                .filter(|s| !s.trim().is_empty()),
+            attachment_download_dir,
+            attachment_allowed_dirs,
+            attachment_max_bytes,
         })
     }
 
@@ -244,6 +265,43 @@ impl ServerConfig {
             .map(|a| !provider_auto_saves_sent(&a.host))
             .unwrap_or(false)
     }
+}
+
+/// Resolve the set of directories from which attachments may be read and to
+/// which downloads may be written.
+///
+/// `MAIL_ATTACHMENT_ALLOWED_DIRS` is a `:`-separated list of directories. When
+/// it is unset or empty, the allowlist defaults to a single entry — the
+/// configured `attachment_download_dir`, or the system temp dir if that is
+/// unset — so the common "download an attachment, then re-attach it to a
+/// reply" workflow keeps working out of the box while arbitrary reads such as
+/// `/etc/passwd` or `~/.ssh/id_rsa` are denied by default.
+fn resolve_attachment_allowed_dirs(download_dir: &Option<String>) -> Vec<PathBuf> {
+    match env::var("MAIL_ATTACHMENT_ALLOWED_DIRS") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let dirs: Vec<PathBuf> = raw
+                .split(':')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+                .collect();
+            if dirs.is_empty() {
+                vec![default_attachment_dir(download_dir)]
+            } else {
+                dirs
+            }
+        }
+        _ => vec![default_attachment_dir(download_dir)],
+    }
+}
+
+/// The single default allowed directory: the configured download dir, else the
+/// system temp dir.
+fn default_attachment_dir(download_dir: &Option<String>) -> PathBuf {
+    download_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Whether an SMTP provider saves a server-side copy of sent mail to the
@@ -787,6 +845,8 @@ mod tests {
             cursor_ttl_seconds: 600,
             cursor_max_entries: 512,
             attachment_download_dir: None,
+            attachment_allowed_dirs: vec![std::env::temp_dir()],
+            attachment_max_bytes: 25_000_000,
         }
     }
 

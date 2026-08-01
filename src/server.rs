@@ -3,7 +3,7 @@
 //! Implements the `ServerHandler` trait and registers 19 MCP tools. Handles
 //! input validation, business logic orchestration, and response formatting.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,6 +38,10 @@ use crate::smtp;
 const MAX_SEARCH_LIMIT: usize = 50;
 /// Maximum attachments to return per message
 const MAX_ATTACHMENTS: usize = 50;
+/// Maximum MIME nesting depth when re-extracting attachments for reply/forward.
+/// Bounds recursion so a maliciously deep multipart tree cannot overflow the
+/// stack.
+const MAX_MIME_DEPTH: usize = 100;
 /// Maximum UID search results stored in a cursor snapshot
 const MAX_CURSOR_UIDS_STORED: usize = 20_000;
 /// Maximum message IDs per bulk operation
@@ -1671,12 +1675,28 @@ impl MailImapServer {
             )));
         };
 
-        let dir = input
-            .output_dir
-            .clone()
-            .or_else(|| self.config.attachment_download_dir.clone())
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
+        let dir = match input.output_dir.clone() {
+            Some(od) => {
+                // A caller-supplied output dir is constrained to the allowlist
+                // so a prompt-injected model cannot drop attachment bytes into
+                // an arbitrary location. The server-configured default and the
+                // temp-dir fallback are operator-controlled and trusted.
+                let resolved = resolve_path_for_allowlist(&PathBuf::from(&od))?;
+                if !is_within_allowed(&resolved, &self.config.attachment_allowed_dirs) {
+                    return Err(AppError::InvalidInput(format!(
+                        "output_dir '{od}' is outside the allowed attachment directories; \
+                         set MAIL_ATTACHMENT_ALLOWED_DIRS to permit additional locations"
+                    )));
+                }
+                resolved
+            }
+            None => self
+                .config
+                .attachment_download_dir
+                .clone()
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir),
+        };
         std::fs::create_dir_all(&dir).map_err(|e| {
             AppError::Internal(format!("failed creating output dir {}: {e}", dir.display()))
         })?;
@@ -3011,7 +3031,7 @@ impl MailImapServer {
         }
 
         let smtp_config = self.config.get_smtp_account(&input.account_id)?;
-        let attachments = decode_attachments(&input.attachments)?;
+        let attachments = decode_attachments(&input.attachments, &self.config)?;
 
         let composition = smtp::EmailComposition {
             from: smtp_config.user.clone(),
@@ -3087,6 +3107,7 @@ impl MailImapServer {
         }
 
         let raw_bytes = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        mime::guard_mime_nesting(&raw_bytes)?;
         let parsed = mailparse::parse_mail(&raw_bytes)
             .map_err(|e| AppError::Internal(format!("failed to parse original message: {e}")))?;
 
@@ -3149,11 +3170,14 @@ impl MailImapServer {
         };
 
         // Collect attachments: original email's + any new ones
-        let mut attachments = decode_attachments(&input.attachments)?;
+        let mut attachments = decode_attachments(&input.attachments, &self.config)?;
         if input.include_original_attachments {
             let original_attachments = extract_attachments_from_message(&parsed);
             attachments.extend(original_attachments);
         }
+        // The original attachments bypass decode_attachments' per-input checks,
+        // so enforce the count and total-size limits on the combined set.
+        enforce_send_attachment_limits(&attachments, &self.config)?;
 
         let composition = smtp::EmailComposition {
             from: smtp_config.user.clone(),
@@ -3230,6 +3254,7 @@ impl MailImapServer {
         }
 
         let raw_bytes = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        mime::guard_mime_nesting(&raw_bytes)?;
         let parsed = mailparse::parse_mail(&raw_bytes)
             .map_err(|e| AppError::Internal(format!("failed to parse original message: {e}")))?;
 
@@ -3339,6 +3364,10 @@ impl MailImapServer {
         &self,
         input: GraphSendMessageInput,
     ) -> AppResult<(String, serde_json::Value)> {
+        // Send gate — Graph is a send path and must honor the same switch as
+        // SMTP and EWS. Without this, `MAIL_SMTP_WRITE_ENABLED=false` would
+        // still allow Graph sends (and file exfiltration via attachments).
+        require_smtp_write_enabled(&self.config)?;
         validate_account_id(&input.account_id)?;
         validate_email_recipients(&input.to, "to")?;
         if !input.cc.is_empty() {
@@ -3391,9 +3420,18 @@ impl MailImapServer {
             references: input.references,
             save_to_sent: input.save_to_sent,
             attachments: {
+                check_attachment_count(input.attachments.len())?;
                 let mut atts = Vec::new();
+                let mut total: u64 = 0;
                 for a in &input.attachments {
-                    let (b64, fname) = resolve_attachment_base64(a)?;
+                    let (b64, fname, len) = resolve_attachment_base64(a, &self.config)?;
+                    total = total.saturating_add(len);
+                    if total > self.config.attachment_max_bytes {
+                        return Err(AppError::InvalidInput(format!(
+                            "total attachment size exceeds the {}-byte limit (MAIL_ATTACHMENT_MAX_BYTES)",
+                            self.config.attachment_max_bytes
+                        )));
+                    }
                     let filename = a.filename.clone().unwrap_or(fname);
                     let content_type = a
                         .content_type
@@ -4130,14 +4168,18 @@ fn extract_attachments_from_message(
     parsed: &mailparse::ParsedMail<'_>,
 ) -> Vec<smtp::EmailAttachment> {
     let mut attachments = Vec::new();
-    extract_attachments_recursive(parsed, &mut attachments);
+    extract_attachments_recursive(parsed, &mut attachments, 0);
     attachments
 }
 
 fn extract_attachments_recursive(
     part: &mailparse::ParsedMail<'_>,
     attachments: &mut Vec<smtp::EmailAttachment>,
+    depth: usize,
 ) {
+    if depth > MAX_MIME_DEPTH {
+        return;
+    }
     let ct = &part.ctype;
     let is_attachment = part.get_content_disposition().disposition
         == mailparse::DispositionType::Attachment
@@ -4166,80 +4208,129 @@ fn extract_attachments_recursive(
     }
 
     for sub in &part.subparts {
-        extract_attachments_recursive(sub, attachments);
+        extract_attachments_recursive(sub, attachments, depth + 1);
     }
 }
 
-/// Decode base64 attachment inputs into raw bytes for SMTP
-fn decode_attachments(inputs: &[AttachmentInput]) -> AppResult<Vec<smtp::EmailAttachment>> {
-    use base64::Engine;
-    inputs
-        .iter()
-        .map(|a| {
-            // Read content from file_path or decode base64
-            let (content, resolved_filename) = if let Some(ref path) = a.file_path {
-                let content = std::fs::read(path).map_err(|e| {
-                    AppError::InvalidInput(format!("cannot read attachment file '{}': {e}", path))
-                })?;
-                let fname = std::path::Path::new(path)
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| "attachment".to_owned());
-                (content, fname)
-            } else if let Some(ref b64) = a.content_base64 {
-                let content = base64::engine::general_purpose::STANDARD
-                    .decode(b64)
-                    .map_err(|e| {
-                        AppError::InvalidInput(format!(
-                            "invalid base64 in attachment '{}': {e}",
-                            a.filename.as_deref().unwrap_or("unknown")
-                        ))
-                    })?;
-                (
-                    content,
-                    a.filename
-                        .clone()
-                        .unwrap_or_else(|| "attachment".to_owned()),
-                )
-            } else {
-                return Err(AppError::InvalidInput(
-                    "attachment must have either 'file_path' or 'content_base64'".to_owned(),
-                ));
-            };
+/// Maximum number of attachments permitted on a single outgoing message.
+const MAX_SEND_ATTACHMENTS: usize = 50;
 
-            let filename = a.filename.clone().unwrap_or(resolved_filename);
+/// Resolve a caller-supplied path to an absolute, symlink-free form suitable
+/// for allowlist checking, tolerating a not-yet-existing final component (so
+/// an `output_dir` that will be created still resolves).
+///
+/// Rejects any `..` component outright: canonicalizing a partially missing
+/// path cannot safely collapse parent traversals, so we refuse them rather
+/// than risk an allowlist bypass.
+fn resolve_path_for_allowlist(path: &Path) -> AppResult<PathBuf> {
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(AppError::InvalidInput(format!(
+            "path '{}' must not contain '..' components",
+            path.display()
+        )));
+    }
 
-            // Auto-detect content type from extension if not provided
-            let content_type = a
-                .content_type
-                .clone()
-                .unwrap_or_else(|| guess_content_type(&filename));
+    // Walk up to the longest existing ancestor, canonicalize it (resolving
+    // symlinks), then re-attach the missing tail components verbatim.
+    let mut existing = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match existing.file_name().map(|f| f.to_os_string()) {
+            Some(name) => {
+                tail.push(name);
+                if !existing.pop() {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
 
-            Ok(smtp::EmailAttachment {
-                filename,
-                content_type,
-                content,
-            })
-        })
-        .collect()
+    let mut resolved = if existing.as_os_str().is_empty() {
+        std::env::current_dir()
+            .map_err(|e| AppError::Internal(format!("cannot resolve current dir: {e}")))?
+    } else {
+        std::fs::canonicalize(&existing).unwrap_or(existing)
+    };
+    for name in tail.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
-/// Resolve attachment to base64 string (for Graph API). Returns (base64, filename).
-fn resolve_attachment_base64(a: &AttachmentInput) -> AppResult<(String, String)> {
-    use base64::Engine;
+/// Whether `path` (already resolved via [`resolve_path_for_allowlist`]) lies
+/// within one of the `allowed` directories.
+fn is_within_allowed(path: &Path, allowed: &[PathBuf]) -> bool {
+    allowed.iter().any(|dir| {
+        let canon = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.clone());
+        path.starts_with(&canon)
+    })
+}
+
+/// Ensure a caller-supplied attachment `file_path` is inside the configured
+/// allowlist. Returns the resolved path on success. Guards against a
+/// prompt-injected model reading arbitrary local files (`~/.ssh/id_rsa`,
+/// `.env`, `/etc/passwd`) and mailing them out as attachments.
+fn ensure_attachment_path_allowed(path: &str, config: &ServerConfig) -> AppResult<PathBuf> {
+    let resolved = resolve_path_for_allowlist(Path::new(path))?;
+    if !is_within_allowed(&resolved, &config.attachment_allowed_dirs) {
+        return Err(AppError::InvalidInput(format!(
+            "attachment path '{path}' is outside the allowed attachment directories; \
+             set MAIL_ATTACHMENT_ALLOWED_DIRS to permit additional locations"
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Read one attachment's raw bytes from either `file_path` (allowlist- and
+/// size-checked) or inline `content_base64` (size-checked). Returns the bytes
+/// and a filename derived from the source.
+fn read_attachment_bytes(
+    a: &AttachmentInput,
+    config: &ServerConfig,
+) -> AppResult<(Vec<u8>, String)> {
     if let Some(ref path) = a.file_path {
-        let content = std::fs::read(path).map_err(|e| {
-            AppError::InvalidInput(format!("cannot read attachment file '{}': {e}", path))
+        let resolved = ensure_attachment_path_allowed(path, config)?;
+        // Check size via metadata BEFORE reading, to bound memory use.
+        let meta = std::fs::metadata(&resolved).map_err(|e| {
+            AppError::InvalidInput(format!("cannot read attachment file '{path}': {e}"))
         })?;
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
-        let fname = std::path::Path::new(path)
+        if meta.len() > config.attachment_max_bytes {
+            return Err(AppError::InvalidInput(format!(
+                "attachment '{path}' is {} bytes, exceeding the {}-byte limit \
+                 (MAIL_ATTACHMENT_MAX_BYTES)",
+                meta.len(),
+                config.attachment_max_bytes
+            )));
+        }
+        let content = std::fs::read(&resolved).map_err(|e| {
+            AppError::InvalidInput(format!("cannot read attachment file '{path}': {e}"))
+        })?;
+        let fname = resolved
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "attachment".to_owned());
-        Ok((b64, fname))
+        Ok((content, fname))
     } else if let Some(ref b64) = a.content_base64 {
+        let content = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| {
+                AppError::InvalidInput(format!(
+                    "invalid base64 in attachment '{}': {e}",
+                    a.filename.as_deref().unwrap_or("unknown")
+                ))
+            })?;
+        if content.len() as u64 > config.attachment_max_bytes {
+            return Err(AppError::InvalidInput(format!(
+                "attachment '{}' is {} bytes, exceeding the {}-byte limit \
+                 (MAIL_ATTACHMENT_MAX_BYTES)",
+                a.filename.as_deref().unwrap_or("unknown"),
+                content.len(),
+                config.attachment_max_bytes
+            )));
+        }
         Ok((
-            b64.clone(),
+            content,
             a.filename
                 .clone()
                 .unwrap_or_else(|| "attachment".to_owned()),
@@ -4249,6 +4340,88 @@ fn resolve_attachment_base64(a: &AttachmentInput) -> AppResult<(String, String)>
             "attachment must have either 'file_path' or 'content_base64'".to_owned(),
         ))
     }
+}
+
+/// Reject an outgoing message that carries more than [`MAX_SEND_ATTACHMENTS`]
+/// attachments.
+fn check_attachment_count(count: usize) -> AppResult<()> {
+    if count > MAX_SEND_ATTACHMENTS {
+        return Err(AppError::InvalidInput(format!(
+            "too many attachments: {count} exceeds the maximum of {MAX_SEND_ATTACHMENTS}"
+        )));
+    }
+    Ok(())
+}
+
+/// Enforce the count and total-size limits on the FINAL attachment set of an
+/// outgoing message. Used after original attachments are appended in the reply
+/// flow, where those extra parts bypass the per-input checks in
+/// [`decode_attachments`].
+fn enforce_send_attachment_limits(
+    attachments: &[smtp::EmailAttachment],
+    config: &ServerConfig,
+) -> AppResult<()> {
+    check_attachment_count(attachments.len())?;
+    let mut total: u64 = 0;
+    for a in attachments {
+        total = total.saturating_add(a.content.len() as u64);
+    }
+    if total > config.attachment_max_bytes {
+        return Err(AppError::InvalidInput(format!(
+            "total attachment size exceeds the {}-byte limit (MAIL_ATTACHMENT_MAX_BYTES)",
+            config.attachment_max_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// Decode base64/file attachment inputs into raw bytes for SMTP. Enforces the
+/// attachment count limit, the per-message total-size limit, and (for
+/// `file_path` inputs) the directory allowlist.
+fn decode_attachments(
+    inputs: &[AttachmentInput],
+    config: &ServerConfig,
+) -> AppResult<Vec<smtp::EmailAttachment>> {
+    check_attachment_count(inputs.len())?;
+    let mut out = Vec::with_capacity(inputs.len());
+    let mut total: u64 = 0;
+    for a in inputs {
+        let (content, resolved_filename) = read_attachment_bytes(a, config)?;
+        total = total.saturating_add(content.len() as u64);
+        if total > config.attachment_max_bytes {
+            return Err(AppError::InvalidInput(format!(
+                "total attachment size exceeds the {}-byte limit (MAIL_ATTACHMENT_MAX_BYTES)",
+                config.attachment_max_bytes
+            )));
+        }
+
+        let filename = a.filename.clone().unwrap_or(resolved_filename);
+        // Auto-detect content type from extension if not provided
+        let content_type = a
+            .content_type
+            .clone()
+            .unwrap_or_else(|| guess_content_type(&filename));
+
+        out.push(smtp::EmailAttachment {
+            filename,
+            content_type,
+            content,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolve attachment to base64 string (for Graph API). Returns
+/// `(base64, filename, decoded_len)`. Applies the same directory-allowlist and
+/// per-attachment size checks as the SMTP path.
+fn resolve_attachment_base64(
+    a: &AttachmentInput,
+    config: &ServerConfig,
+) -> AppResult<(String, String, u64)> {
+    let (content, fname) = read_attachment_bytes(a, config)?;
+    let len = content.len() as u64;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&content);
+    Ok((b64, fname, len))
 }
 
 /// Guess MIME type from file extension
@@ -4488,11 +4661,18 @@ fn parse_bulk_message_ids(account_id: &str, message_ids: &[String]) -> AppResult
 /// Tests for server-side validation and encoding helpers.
 mod tests {
     use super::{
-        encode_raw_source_base64, escape_imap_quoted, is_sent_folder_name,
+        MAX_SEND_ATTACHMENTS, MailImapServer, check_attachment_count, decode_attachments,
+        encode_raw_source_base64, enforce_send_attachment_limits, escape_imap_quoted,
+        is_sent_folder_name, is_within_allowed, read_attachment_bytes, resolve_path_for_allowlist,
         sanitize_attachment_filename, select_attachment, validate_email_no_wrapper_leak,
         validate_flag, validate_mailbox, validate_search_text,
     };
+    use crate::config::ServerConfig;
     use crate::mime::ExtractedAttachment;
+    use crate::models::{AttachmentInput, GraphSendMessageInput};
+    use base64::Engine;
+    use std::collections::{BTreeMap, HashMap};
+    use std::path::{Path, PathBuf};
 
     fn att(part_id: &str, filename: Option<&str>) -> ExtractedAttachment {
         ExtractedAttachment {
@@ -4500,6 +4680,69 @@ mod tests {
             content_type: "application/octet-stream".to_owned(),
             part_id: part_id.to_owned(),
             bytes: Vec::new(),
+        }
+    }
+
+    /// Build a minimal `ServerConfig` for exercising attachment policy and the
+    /// send gate. Only the attachment allowlist, size cap, and SMTP write flag
+    /// are meaningful; everything else is an inert default.
+    fn attachment_cfg(
+        allowed_dirs: Vec<PathBuf>,
+        max_bytes: u64,
+        smtp_write_enabled: bool,
+    ) -> ServerConfig {
+        ServerConfig {
+            accounts: BTreeMap::new(),
+            oauth2_accounts: HashMap::new(),
+            graph_oauth2_accounts: HashMap::new(),
+            ews_accounts: HashMap::new(),
+            ews_oauth2_accounts: HashMap::new(),
+            smtp_accounts: HashMap::new(),
+            smtp_write_enabled,
+            smtp_save_sent: None,
+            smtp_connect_timeout_ms: 30_000,
+            smtp_send_timeout_ms: 300_000,
+            write_enabled: false,
+            connect_timeout_ms: 30_000,
+            greeting_timeout_ms: 15_000,
+            socket_timeout_ms: 300_000,
+            cursor_ttl_seconds: 600,
+            cursor_max_entries: 512,
+            attachment_download_dir: None,
+            attachment_allowed_dirs: allowed_dirs,
+            attachment_max_bytes: max_bytes,
+        }
+    }
+
+    /// Create (and clean) a fresh temp subdirectory unique to a test.
+    fn temp_subdir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mail-mcp-test-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp subdir");
+        dir
+    }
+
+    fn file_attachment(path: &Path) -> AttachmentInput {
+        AttachmentInput {
+            file_path: Some(path.to_string_lossy().to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn graph_input() -> GraphSendMessageInput {
+        GraphSendMessageInput {
+            account_id: "default".to_owned(),
+            to: vec!["recipient@example.com".to_owned()],
+            cc: vec![],
+            bcc: vec![],
+            subject: "hi".to_owned(),
+            body_text: Some("hi".to_owned()),
+            body_html: None,
+            reply_to: None,
+            in_reply_to: None,
+            references: None,
+            save_to_sent: true,
+            attachments: vec![],
         }
     }
 
@@ -4686,5 +4929,187 @@ mod tests {
             "<p>El XML tiene <code>&lt;parameter name=\"timeout\"&gt;</code> en la config.</p>",
         )
         .expect("generic <parameter> mention must pass");
+    }
+
+    // ─── Attachment path allowlist (HIGH-2) ──────────────────────────────
+
+    #[test]
+    fn resolve_path_rejects_parent_traversal() {
+        assert!(resolve_path_for_allowlist(Path::new("/tmp/../etc/passwd")).is_err());
+        assert!(resolve_path_for_allowlist(Path::new("../secret")).is_err());
+    }
+
+    #[test]
+    fn is_within_allowed_is_component_wise() {
+        let dir = temp_subdir("within");
+        // A path under the allowed dir (even if not yet created) is inside.
+        let inside = resolve_path_for_allowlist(&dir.join("sub").join("f.txt")).unwrap();
+        assert!(is_within_allowed(&inside, std::slice::from_ref(&dir)));
+        // A sibling that only shares a name *prefix* is NOT inside.
+        let sibling =
+            resolve_path_for_allowlist(&std::env::temp_dir().join("mail-mcp-test-within-evil"))
+                .unwrap();
+        assert!(!is_within_allowed(&sibling, &[dir]));
+    }
+
+    #[test]
+    fn read_attachment_reads_file_inside_allowlist() {
+        let dir = temp_subdir("read-allowed");
+        let file = dir.join("ok.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let cfg = attachment_cfg(vec![dir.clone()], 25_000_000, false);
+
+        let (bytes, name) = read_attachment_bytes(&file_attachment(&file), &cfg).unwrap();
+        assert_eq!(bytes, b"hello");
+        assert_eq!(name, "ok.txt");
+    }
+
+    #[test]
+    fn read_attachment_rejects_file_outside_allowlist() {
+        let allowed = temp_subdir("outside-allowed");
+        let other = temp_subdir("outside-other");
+        let secret = other.join("id_rsa");
+        std::fs::write(&secret, b"PRIVATE KEY").unwrap();
+        let cfg = attachment_cfg(vec![allowed], 25_000_000, false);
+
+        let err = read_attachment_bytes(&file_attachment(&secret), &cfg).unwrap_err();
+        assert!(
+            format!("{err}").contains("outside the allowed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn read_attachment_rejects_symlink_escape() {
+        // A symlink inside the allowlist pointing outside it must be caught by
+        // canonicalization.
+        let allowed = temp_subdir("symlink-allowed");
+        let other = temp_subdir("symlink-other");
+        let secret = other.join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+        let link = allowed.join("link.txt");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            let cfg = attachment_cfg(vec![allowed], 25_000_000, false);
+            let err = read_attachment_bytes(&file_attachment(&link), &cfg).unwrap_err();
+            assert!(
+                format!("{err}").contains("outside the allowed"),
+                "got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn read_attachment_enforces_per_file_size_cap() {
+        let dir = temp_subdir("size-cap");
+        let file = dir.join("big.bin");
+        std::fs::write(&file, vec![0u8; 1000]).unwrap();
+        let cfg = attachment_cfg(vec![dir], 100, false);
+
+        let err = read_attachment_bytes(&file_attachment(&file), &cfg).unwrap_err();
+        assert!(format!("{err}").contains("exceeding"), "got: {err}");
+    }
+
+    #[test]
+    fn read_attachment_base64_enforces_size_cap() {
+        let big = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 1000]);
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 100, false);
+        let input = AttachmentInput {
+            content_base64: Some(big),
+            ..Default::default()
+        };
+        assert!(read_attachment_bytes(&input, &cfg).is_err());
+    }
+
+    #[test]
+    fn check_attachment_count_enforced() {
+        assert!(check_attachment_count(MAX_SEND_ATTACHMENTS).is_ok());
+        assert!(check_attachment_count(MAX_SEND_ATTACHMENTS + 1).is_err());
+    }
+
+    fn sized_attachment(bytes: usize) -> crate::smtp::EmailAttachment {
+        crate::smtp::EmailAttachment {
+            filename: "a.bin".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            content: vec![0u8; bytes],
+        }
+    }
+
+    // The reply flow appends original attachments after decode_attachments'
+    // per-input checks; enforce_send_attachment_limits guards the combined set.
+    #[test]
+    fn enforce_send_limits_catches_oversize_total() {
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 100, false);
+        let atts = vec![sized_attachment(60), sized_attachment(60)]; // 120 > 100
+        let err = match enforce_send_attachment_limits(&atts, &cfg) {
+            Ok(_) => panic!("expected total-size error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("total attachment size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_send_limits_catches_too_many() {
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 25_000_000, false);
+        let atts: Vec<_> = (0..=MAX_SEND_ATTACHMENTS)
+            .map(|_| sized_attachment(1))
+            .collect();
+        assert!(enforce_send_attachment_limits(&atts, &cfg).is_err());
+    }
+
+    #[test]
+    fn decode_attachments_enforces_total_size() {
+        // Two 60-byte parts each pass the per-file cap (100) but together
+        // (120) exceed the per-message total.
+        let part = base64::engine::general_purpose::STANDARD.encode(vec![0u8; 60]);
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 100, false);
+        let a = AttachmentInput {
+            content_base64: Some(part),
+            ..Default::default()
+        };
+        // `EmailAttachment` isn't `Debug`, so match rather than `unwrap_err`.
+        let err = match decode_attachments(&[a.clone(), a], &cfg) {
+            Ok(_) => panic!("expected total-size error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("total attachment size"),
+            "got: {err}"
+        );
+    }
+
+    // ─── Graph send gate (HIGH-1) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn graph_send_blocked_when_smtp_write_disabled() {
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 25_000_000, false);
+        let server = MailImapServer::new(cfg, None);
+        let err = server
+            .graph_send_message_impl(graph_input())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains("MAIL_SMTP_WRITE_ENABLED"),
+            "graph send must be blocked by the send gate; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_send_passes_gate_when_enabled() {
+        // With the gate open it proceeds past it and fails later for lack of
+        // OAuth2 config — proving the gate (not something else) was the blocker.
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 25_000_000, true);
+        let server = MailImapServer::new(cfg, None);
+        let err = server
+            .graph_send_message_impl(graph_input())
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(!msg.contains("MAIL_SMTP_WRITE_ENABLED"), "got: {msg}");
+        assert!(msg.contains("OAuth2"), "got: {msg}");
     }
 }
