@@ -77,6 +77,47 @@ When `MAIL_IMAP_WRITE_ENABLED=false`, these tools return errors:
 }
 ```
 
+## Send Operation Gating
+
+All outgoing-mail tools — SMTP (`smtp_send_message`, `smtp_reply_message`,
+`smtp_forward_message`), EWS (`ews_send_message`), and Microsoft Graph
+(`graph_send_message`) — are disabled unless `MAIL_SMTP_WRITE_ENABLED=true`.
+The gate is enforced server-side at the top of each send handler, so no send
+path (including Graph) can transmit mail while the switch is off.
+
+```bash
+MAIL_SMTP_WRITE_ENABLED=true
+```
+
+## Attachment Path Restrictions
+
+Outgoing-mail tools accept attachments either inline (`content_base64`) or by
+local `file_path`. To stop a prompt-injected model from reading and
+exfiltrating arbitrary local files (for example `~/.ssh/id_rsa`, `/etc/passwd`,
+or the server's own `.env`), `file_path` reads are confined to an allowlist:
+
+- `MAIL_ATTACHMENT_ALLOWED_DIRS` — a `:`-separated list of directories from
+  which attachments may be read, and under which a caller-supplied download
+  `output_dir` must fall. Paths are canonicalized (resolving symlinks and
+  rejecting `..`) before the containment check, so neither traversal nor a
+  symlink planted inside an allowed directory can escape it.
+- When unset, the allowlist defaults to a single entry: the configured
+  `MAIL_ATTACHMENT_DOWNLOAD_DIR`, or the system temp directory if that is also
+  unset. This keeps the common "download an attachment, then re-attach it to a
+  reply" workflow working while denying arbitrary reads by default.
+- `MAIL_ATTACHMENT_MAX_BYTES` (default 25 MB) caps the total size of all
+  attachments on a single outgoing message, and no more than 50 attachments may
+  be sent per message. Sizes are checked from filesystem metadata before the
+  file is read into memory.
+
+## MIME Depth Bounding
+
+Inbound messages are parsed recursively. To prevent a maliciously deep
+multipart tree from overflowing the stack (a remote denial of service), MIME
+traversal is capped at 100 levels of nesting; messages exceeding the cap are
+rejected rather than parsed. PDF text extraction (opt-in, ≤ 5 MB) is additionally
+run inside a panic boundary so a malformed PDF cannot abort the request.
+
 ## Output Bounding
 
 All potentially large outputs are bounded to prevent resource exhaustion.

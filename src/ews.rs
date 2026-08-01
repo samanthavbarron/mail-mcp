@@ -128,24 +128,7 @@ pub async fn find_items(
     max_items: usize,
     offset: usize,
 ) -> AppResult<Vec<EwsMessage>> {
-    let folder_id = match folder.to_ascii_lowercase().as_str() {
-        "inbox" => "inbox",
-        "sent" | "sentitems" | "sent items" => "sentitems",
-        "drafts" => "drafts",
-        "deleted" | "deleteditems" => "deleteditems",
-        "junk" | "junkemail" => "junkemail",
-        _ => folder,
-    };
-
-    let is_distinguished = matches!(
-        folder_id,
-        "inbox" | "sentitems" | "drafts" | "deleteditems" | "junkemail"
-    );
-    let folder_xml = if is_distinguished {
-        format!(r#"<t:DistinguishedFolderId Id="{folder_id}"/>"#)
-    } else {
-        format!(r#"<t:FolderId Id="{folder_id}"/>"#)
-    };
+    let folder_xml = parent_folder_xml(folder);
 
     let soap = format!(
         r#"<m:FindItem Traversal="Shallow">
@@ -180,7 +163,44 @@ pub async fn get_item(
     account_id: &str,
     item_id: &str,
 ) -> AppResult<EwsMessageDetail> {
-    let soap = format!(
+    let soap = get_item_soap(item_id);
+    let xml = ews_request(token_manager, account_id, &soap).await?;
+    parse_get_item_response(&xml)
+}
+
+/// Build the `<t:ParentFolderId>` inner XML for a folder name.
+///
+/// Known aliases map to distinguished folder IDs (safe literals); any other
+/// caller-supplied name is emitted as a `<t:FolderId>` with its value escaped
+/// to prevent SOAP/XML injection.
+fn parent_folder_xml(folder: &str) -> String {
+    let folder_id = match folder.to_ascii_lowercase().as_str() {
+        "inbox" => "inbox",
+        "sent" | "sentitems" | "sent items" => "sentitems",
+        "drafts" => "drafts",
+        "deleted" | "deleteditems" => "deleteditems",
+        "junk" | "junkemail" => "junkemail",
+        _ => folder,
+    };
+
+    let is_distinguished = matches!(
+        folder_id,
+        "inbox" | "sentitems" | "drafts" | "deleteditems" | "junkemail"
+    );
+    if is_distinguished {
+        // `folder_id` here is one of the hardcoded distinguished names above.
+        format!(r#"<t:DistinguishedFolderId Id="{folder_id}"/>"#)
+    } else {
+        // Caller-supplied folder name — escape to prevent SOAP/XML injection.
+        format!(r#"<t:FolderId Id="{}"/>"#, escape_xml(folder_id))
+    }
+}
+
+/// Build the `GetItem` SOAP body for an item ID, escaping the caller-supplied
+/// ID to prevent SOAP/XML injection.
+fn get_item_soap(item_id: &str) -> String {
+    let item_id = escape_xml(item_id);
+    format!(
         r#"<m:GetItem>
       <m:ItemShape>
         <t:BaseShape>Default</t:BaseShape>
@@ -196,10 +216,7 @@ pub async fn get_item(
         <t:ItemId Id="{item_id}"/>
       </m:ItemIds>
     </m:GetItem>"#
-    );
-
-    let xml = ews_request(token_manager, account_id, &soap).await?;
-    parse_get_item_response(&xml)
+    )
 }
 
 /// Parameters for sending an email via EWS.
@@ -898,6 +915,44 @@ mod tests {
         assert_eq!(escape_xml("'"), "&apos;");
         // Order: & must be escaped first so we don't double-escape
         assert_eq!(escape_xml("a&b<c"), "a&amp;b&lt;c");
+    }
+
+    #[test]
+    fn parent_folder_xml_maps_distinguished_aliases() {
+        assert_eq!(
+            parent_folder_xml("inbox"),
+            r#"<t:DistinguishedFolderId Id="inbox"/>"#
+        );
+        assert_eq!(
+            parent_folder_xml("Sent Items"),
+            r#"<t:DistinguishedFolderId Id="sentitems"/>"#
+        );
+    }
+
+    #[test]
+    fn parent_folder_xml_escapes_injection_in_custom_folder() {
+        // A malicious folder name must not break out of the Id="..." attribute
+        // to inject extra SOAP elements.
+        let evil = r#"x"/><t:FolderId Id="AAA"/><foo bar=""#;
+        let xml = parent_folder_xml(evil);
+        assert!(xml.starts_with(r#"<t:FolderId Id=""#));
+        // The closing-quote-plus-tag breakout must be neutralized.
+        assert!(!xml.contains(r#""/><t:FolderId"#));
+        assert!(xml.contains("&quot;"));
+        assert!(xml.contains("&lt;"));
+        // Exactly one FolderId element is produced.
+        assert_eq!(xml.matches("<t:FolderId").count(), 1);
+    }
+
+    #[test]
+    fn get_item_soap_escapes_injection_in_item_id() {
+        let evil = r#"AAA"/></m:ItemIds><m:ItemIds><t:ItemId Id="BBB"#;
+        let soap = get_item_soap(evil);
+        // Injected extra ItemIds must be neutralized — only the one from the
+        // template survives, and the attacker payload is escaped.
+        assert_eq!(soap.matches("<m:ItemIds>").count(), 1);
+        assert!(soap.contains("&quot;"));
+        assert!(soap.contains("&lt;/m:ItemIds&gt;"));
     }
 
     #[test]
