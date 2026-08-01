@@ -124,7 +124,7 @@ cd "$REPO_ROOT"
 echo "Building server binary"
 cargo build --quiet
 
-SERVER_BIN="$REPO_ROOT/target/debug/mail-imap-mcp-rs"
+SERVER_BIN="$REPO_ROOT/target/debug/mail-mcp"
 
 export MAIL_IMAP_DEFAULT_HOST="$GREENMAIL_HOST"
 export MAIL_IMAP_DEFAULT_PORT="$GREENMAIL_IMAP_PORT"

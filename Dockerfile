@@ -6,5 +6,5 @@ RUN cargo build --release
 
 FROM alpine:latest
 LABEL org.opencontainers.image.description="Secure IMAP MCP server over stdio with cursor-based pagination, multi-account support, and TLS-only connections"
-COPY --from=builder /app/target/release/mail-imap-mcp-rs /mail-imap-mcp-rs
-ENTRYPOINT ["/mail-imap-mcp-rs"]
+COPY --from=builder /app/target/release/mail-mcp /mail-mcp
+ENTRYPOINT ["/mail-mcp"]
