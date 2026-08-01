@@ -456,9 +456,19 @@ mod tests {
 
     use super::{
         DEFAULT_HTTP_ADDR, DEFAULT_HTTP_PATH, TransportMode, build_help_output,
-        discover_account_sections, is_secret_key, redact_value, resolve_transport,
+        discover_account_sections, env_lookup, is_secret_key, redact_value, resolve_transport,
         should_print_help,
     };
+
+    #[test]
+    fn env_lookup_trims_and_falls_back_on_blank_or_missing() {
+        let mut env_map = BTreeMap::new();
+        assert_eq!(env_lookup(&env_map, "K", "def"), "def");
+        env_map.insert("K".to_owned(), "   ".to_owned());
+        assert_eq!(env_lookup(&env_map, "K", "def"), "def");
+        env_map.insert("K".to_owned(), "  value  ".to_owned());
+        assert_eq!(env_lookup(&env_map, "K", "def"), "value");
+    }
 
     #[test]
     fn detects_short_and_long_help_flags() {
