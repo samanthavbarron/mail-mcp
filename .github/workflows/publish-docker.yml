@@ -1,7 +1,13 @@
 name: Publish Docker Image
 
 on:
+  # Manual runs remain available.
   workflow_dispatch:
+  # Publish a fresh :latest (plus the current version tag) on every merge to
+  # main, and a versioned image on each vX.Y.Z release tag.
+  push:
+    branches: [main]
+    tags: ["v*"]
 
 permissions:
   contents: read
