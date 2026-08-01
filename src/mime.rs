@@ -11,10 +11,49 @@ use mailparse::{DispositionType, MailHeader, ParsedMail};
 use crate::errors::{AppError, AppResult};
 use crate::models::AttachmentInfo;
 
-/// Maximum MIME nesting depth. Real messages nest only a few levels; a much
-/// larger cap still rejects maliciously deep multipart trees before they can
-/// overflow the stack during recursive traversal.
+/// Maximum MIME nesting depth for our own recursive traversal. Real messages
+/// nest only a few levels; this bounds `walk_parts`/`walk_attachment_parts`.
 const MAX_MIME_DEPTH: usize = 100;
+
+/// Maximum number of `multipart/` declarations permitted in a raw message.
+///
+/// `mailparse::parse_mail` recurses eagerly over the multipart tree *before*
+/// our own traversal runs, so a deeply nested message can overflow the stack
+/// inside the parser itself — a post-parse depth cap is too late. MIME nesting
+/// depth is bounded by the number of multipart parts (each level requires one
+/// `Content-Type: multipart/*` header), so rejecting messages with too many
+/// multipart declarations *before* parsing bounds the parser's recursion.
+/// 256 is far above any legitimate message yet well under the ~1000-deep
+/// overflow threshold on a 2 MiB worker stack.
+const MAX_MULTIPART_PARTS: usize = 256;
+
+/// Reject a raw message whose multipart nesting could overflow the stack during
+/// `mailparse::parse_mail`. MUST be called before parsing untrusted message
+/// bytes.
+///
+/// Counts `multipart/` occurrences (ASCII case-insensitive) — an upper bound on
+/// nesting depth, since that is the only construct `mailparse` recurses into.
+/// Occurrences in body text only make the check stricter, never weaker.
+///
+/// # Errors
+///
+/// - `Internal` if more than [`MAX_MULTIPART_PARTS`] multipart declarations are present.
+pub fn guard_mime_nesting(raw: &[u8]) -> AppResult<()> {
+    const NEEDLE: &[u8] = b"multipart/";
+    let mut count = 0usize;
+    for window in raw.windows(NEEDLE.len()) {
+        if window.eq_ignore_ascii_case(NEEDLE) {
+            count += 1;
+            if count > MAX_MULTIPART_PARTS {
+                return Err(AppError::Internal(format!(
+                    "message declares more than {MAX_MULTIPART_PARTS} multipart parts; \
+                     refusing to parse (possible MIME nesting attack)"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Parsed message representation
 ///
@@ -65,6 +104,7 @@ pub fn parse_message(
     extract_attachment_text: bool,
     attachment_text_max_chars: usize,
 ) -> AppResult<ParsedMessage> {
+    guard_mime_nesting(raw)?;
     let parsed = mailparse::parse_mail(raw)
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
 
@@ -235,6 +275,7 @@ pub struct ExtractedAttachment {
 ///
 /// - `Internal` if `mailparse` fails or an attachment body cannot be decoded
 pub fn collect_attachments(raw: &[u8]) -> AppResult<Vec<ExtractedAttachment>> {
+    guard_mime_nesting(raw)?;
     let parsed = mailparse::parse_mail(raw)
         .map_err(|e| AppError::Internal(format!("failed to parse RFC822 message: {e}")))?;
     let mut out = Vec::new();
@@ -435,28 +476,49 @@ mod tests {
         assert_eq!(att.part_id, meta_part_id);
     }
 
-    /// A multipart tree nested far beyond `MAX_MIME_DEPTH` must be rejected
-    /// rather than overflow the stack during recursive traversal.
+    /// The pre-parse guard counts multipart declarations and rejects an
+    /// excessive number, case-insensitively.
     #[test]
-    fn deeply_nested_multipart_is_rejected() {
+    fn guard_mime_nesting_rejects_excess_multiparts() {
+        use super::guard_mime_nesting;
+
+        // A couple of multipart declarations is normal.
+        let ok = b"Content-Type: multipart/mixed; boundary=x\r\n\r\n--x\r\n\
+                   Content-Type: multipart/alternative; boundary=y\r\n";
+        assert!(guard_mime_nesting(ok).is_ok());
+
+        // Well over the cap, in either case, is rejected.
+        let many_lower = "Content-Type: multipart/mixed; boundary=b\r\n".repeat(300);
+        assert!(guard_mime_nesting(many_lower.as_bytes()).is_err());
+        let many_upper = "CONTENT-TYPE: MULTIPART/MIXED; boundary=b\r\n".repeat(300);
+        assert!(guard_mime_nesting(many_upper.as_bytes()).is_err());
+    }
+
+    /// A message nested deep enough to overflow the parser's own stack must be
+    /// rejected BEFORE `mailparse::parse_mail` recurses. Without the pre-parse
+    /// guard this test aborts the process with a stack overflow — so it is a
+    /// genuine regression guard for that fix, not just the post-parse cap.
+    #[test]
+    fn deeply_nested_multipart_is_rejected_before_parsing() {
         use super::collect_attachments;
 
-        let depth = super::MAX_MIME_DEPTH + 30;
-        let mut body = String::from("deepest body\r\n");
-        for i in 0..depth {
-            let boundary = format!("B{i}");
-            body = format!(
-                "Content-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n\
-                 --{boundary}\r\n{body}\r\n--{boundary}--\r\n"
-            );
-        }
-        let raw = format!(
-            "From: a@example.com\r\nTo: b@example.com\r\nSubject: nested\r\n\
-             MIME-Version: 1.0\r\n{body}"
+        // Build ~2000 nested multipart levels in O(n): all opening headers,
+        // a body, then all closing boundaries.
+        let depth = 2000;
+        let mut raw = String::from(
+            "From: a@example.com\r\nTo: b@example.com\r\nSubject: nested\r\nMIME-Version: 1.0\r\n",
         );
+        for i in 0..depth {
+            raw.push_str(&format!(
+                "Content-Type: multipart/mixed; boundary=\"b{i}\"\r\n\r\n--b{i}\r\n"
+            ));
+        }
+        raw.push_str("deepest body\r\n");
+        for i in (0..depth).rev() {
+            raw.push_str(&format!("--b{i}--\r\n"));
+        }
         let raw = raw.as_bytes();
 
-        // Both parse paths refuse the message instead of recursing without bound.
         assert!(parse_message(raw, 2000, true, false, 10000).is_err());
         assert!(collect_attachments(raw).is_err());
     }

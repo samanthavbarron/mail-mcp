@@ -3107,6 +3107,7 @@ impl MailImapServer {
         }
 
         let raw_bytes = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        mime::guard_mime_nesting(&raw_bytes)?;
         let parsed = mailparse::parse_mail(&raw_bytes)
             .map_err(|e| AppError::Internal(format!("failed to parse original message: {e}")))?;
 
@@ -3174,6 +3175,9 @@ impl MailImapServer {
             let original_attachments = extract_attachments_from_message(&parsed);
             attachments.extend(original_attachments);
         }
+        // The original attachments bypass decode_attachments' per-input checks,
+        // so enforce the count and total-size limits on the combined set.
+        enforce_send_attachment_limits(&attachments, &self.config)?;
 
         let composition = smtp::EmailComposition {
             from: smtp_config.user.clone(),
@@ -3250,6 +3254,7 @@ impl MailImapServer {
         }
 
         let raw_bytes = imap::fetch_raw_message(&self.config, &mut session, msg_id.uid).await?;
+        mime::guard_mime_nesting(&raw_bytes)?;
         let parsed = mailparse::parse_mail(&raw_bytes)
             .map_err(|e| AppError::Internal(format!("failed to parse original message: {e}")))?;
 
@@ -4348,6 +4353,28 @@ fn check_attachment_count(count: usize) -> AppResult<()> {
     Ok(())
 }
 
+/// Enforce the count and total-size limits on the FINAL attachment set of an
+/// outgoing message. Used after original attachments are appended in the reply
+/// flow, where those extra parts bypass the per-input checks in
+/// [`decode_attachments`].
+fn enforce_send_attachment_limits(
+    attachments: &[smtp::EmailAttachment],
+    config: &ServerConfig,
+) -> AppResult<()> {
+    check_attachment_count(attachments.len())?;
+    let mut total: u64 = 0;
+    for a in attachments {
+        total = total.saturating_add(a.content.len() as u64);
+    }
+    if total > config.attachment_max_bytes {
+        return Err(AppError::InvalidInput(format!(
+            "total attachment size exceeds the {}-byte limit (MAIL_ATTACHMENT_MAX_BYTES)",
+            config.attachment_max_bytes
+        )));
+    }
+    Ok(())
+}
+
 /// Decode base64/file attachment inputs into raw bytes for SMTP. Enforces the
 /// attachment count limit, the per-message total-size limit, and (for
 /// `file_path` inputs) the directory allowlist.
@@ -4635,10 +4662,10 @@ fn parse_bulk_message_ids(account_id: &str, message_ids: &[String]) -> AppResult
 mod tests {
     use super::{
         MAX_SEND_ATTACHMENTS, MailImapServer, check_attachment_count, decode_attachments,
-        encode_raw_source_base64, escape_imap_quoted, is_sent_folder_name, is_within_allowed,
-        read_attachment_bytes, resolve_path_for_allowlist, sanitize_attachment_filename,
-        select_attachment, validate_email_no_wrapper_leak, validate_flag, validate_mailbox,
-        validate_search_text,
+        encode_raw_source_base64, enforce_send_attachment_limits, escape_imap_quoted,
+        is_sent_folder_name, is_within_allowed, read_attachment_bytes, resolve_path_for_allowlist,
+        sanitize_attachment_filename, select_attachment, validate_email_no_wrapper_leak,
+        validate_flag, validate_mailbox, validate_search_text,
     };
     use crate::config::ServerConfig;
     use crate::mime::ExtractedAttachment;
@@ -4999,6 +5026,39 @@ mod tests {
     fn check_attachment_count_enforced() {
         assert!(check_attachment_count(MAX_SEND_ATTACHMENTS).is_ok());
         assert!(check_attachment_count(MAX_SEND_ATTACHMENTS + 1).is_err());
+    }
+
+    fn sized_attachment(bytes: usize) -> crate::smtp::EmailAttachment {
+        crate::smtp::EmailAttachment {
+            filename: "a.bin".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            content: vec![0u8; bytes],
+        }
+    }
+
+    // The reply flow appends original attachments after decode_attachments'
+    // per-input checks; enforce_send_attachment_limits guards the combined set.
+    #[test]
+    fn enforce_send_limits_catches_oversize_total() {
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 100, false);
+        let atts = vec![sized_attachment(60), sized_attachment(60)]; // 120 > 100
+        let err = match enforce_send_attachment_limits(&atts, &cfg) {
+            Ok(_) => panic!("expected total-size error"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err}").contains("total attachment size"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_send_limits_catches_too_many() {
+        let cfg = attachment_cfg(vec![std::env::temp_dir()], 25_000_000, false);
+        let atts: Vec<_> = (0..=MAX_SEND_ATTACHMENTS)
+            .map(|_| sized_attachment(1))
+            .collect();
+        assert!(enforce_send_attachment_limits(&atts, &cfg).is_err());
     }
 
     #[test]
