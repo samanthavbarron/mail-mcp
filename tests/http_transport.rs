@@ -52,11 +52,22 @@ fn base_command() -> Command {
 /// Spawn the server on the HTTP transport and block until it accepts a TCP
 /// connection (the startup update-check adds up to ~2s before it binds).
 fn spawn_http(path: &str) -> (String, ServerGuard) {
+    spawn_http_auth(path, None)
+}
+
+/// As [`spawn_http`], but optionally sets `MAIL_MCP_AUTH_TOKEN` so the endpoint
+/// demands a matching bearer token.
+fn spawn_http_auth(path: &str, token: Option<&str>) -> (String, ServerGuard) {
     let addr = format!("127.0.0.1:{}", reserve_port());
-    let child = base_command()
-        .env("MAIL_MCP_TRANSPORT", "http")
+    let mut cmd = base_command();
+    cmd.env("MAIL_MCP_TRANSPORT", "http")
         .env("MAIL_MCP_HTTP_ADDR", &addr)
-        .env("MAIL_MCP_HTTP_PATH", path)
+        .env("MAIL_MCP_HTTP_PATH", path);
+    match token {
+        Some(token) => cmd.env("MAIL_MCP_AUTH_TOKEN", token),
+        None => cmd.env_remove("MAIL_MCP_AUTH_TOKEN"),
+    };
+    let child = cmd
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -76,11 +87,29 @@ fn spawn_http(path: &str) -> (String, ServerGuard) {
 /// assert on the status line, headers, and JSON substrings without dechunking
 /// or waiting for an SSE stream to end.
 fn http_roundtrip(addr: &str, method: &str, path: &str, accept: &str, body: &str) -> String {
+    http_roundtrip_auth(addr, method, path, accept, body, None)
+}
+
+/// As [`http_roundtrip`], but sends `auth` verbatim as the `Authorization`
+/// header when supplied.
+fn http_roundtrip_auth(
+    addr: &str,
+    method: &str,
+    path: &str,
+    accept: &str,
+    body: &str,
+    auth: Option<&str>,
+) -> String {
+    let auth_header = match auth {
+        Some(value) => format!("Authorization: {value}\r\n"),
+        None => String::new(),
+    };
     let request = format!(
         "{method} {path} HTTP/1.1\r\n\
          Host: {addr}\r\n\
          Accept: {accept}\r\n\
          Content-Type: application/json\r\n\
+         {auth_header}\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -217,6 +246,65 @@ fn http_unsupported_method_is_405() {
     assert!(
         resp.starts_with("HTTP/1.1 405"),
         "PUT should be 405 Method Not Allowed:\n{resp}"
+    );
+}
+
+#[test]
+fn http_auth_rejects_missing_and_wrong_bearer() {
+    let (addr, _guard) = spawn_http_auth("/mcp", Some("s3cret-token"));
+    let accept = "application/json, text/event-stream";
+
+    for (label, header) in [
+        ("no Authorization header", None),
+        ("wrong token", Some("Bearer not-the-token")),
+        ("right token, wrong scheme", Some("Basic s3cret-token")),
+        ("bare token, no scheme", Some("s3cret-token")),
+    ] {
+        let resp = http_roundtrip_auth(&addr, "POST", "/mcp", accept, INITIALIZE, header);
+        assert!(
+            resp.starts_with("HTTP/1.1 401"),
+            "{label} must be rejected with 401:\n{resp}"
+        );
+        assert!(
+            resp.to_ascii_lowercase()
+                .contains("www-authenticate: bearer"),
+            "{label}: 401 must carry a bearer challenge:\n{resp}"
+        );
+        // The rejection happens ahead of the MCP service, so no session is
+        // opened and no handshake result leaks.
+        assert!(
+            !resp.to_ascii_lowercase().contains("mcp-session-id:"),
+            "{label} must not open a session:\n{resp}"
+        );
+        assert!(
+            !resp.contains(r#""serverInfo""#),
+            "{label} must not reach the MCP service:\n{resp}"
+        );
+    }
+}
+
+#[test]
+fn http_auth_accepts_matching_bearer() {
+    let (addr, _guard) = spawn_http_auth("/mcp", Some("s3cret-token"));
+    let resp = http_roundtrip_auth(
+        &addr,
+        "POST",
+        "/mcp",
+        "application/json, text/event-stream",
+        INITIALIZE,
+        Some("Bearer s3cret-token"),
+    );
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "the matching token must be accepted:\n{resp}"
+    );
+    assert!(
+        resp.to_ascii_lowercase().contains("mcp-session-id:"),
+        "an authenticated initialize must return a session id:\n{resp}"
+    );
+    assert!(
+        resp.contains(r#""name":"mail-mcp""#),
+        "an authenticated initialize must reach the MCP service:\n{resp}"
     );
 }
 

@@ -34,6 +34,7 @@ use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use config::ServerConfig;
 use rmcp::ServiceExt;
 use rmcp::transport::stdio;
@@ -52,8 +53,13 @@ const DEFAULT_HTTP_PATH: &str = "/mcp";
 enum TransportMode {
     /// Serve over stdio (default; spawned by an MCP client).
     Stdio,
-    /// Serve over streamable HTTP on `addr`, mounted at `path`.
-    Http { addr: String, path: String },
+    /// Serve over streamable HTTP on `addr`, mounted at `path`, optionally
+    /// requiring a bearer `token` on every request.
+    Http {
+        addr: String,
+        path: String,
+        token: Option<String>,
+    },
 }
 
 /// Application entry point
@@ -112,8 +118,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
             service.waiting().await?;
         }
-        TransportMode::Http { addr, path } => {
-            serve_http(config, update_notice, &addr, &path).await?;
+        TransportMode::Http { addr, path, token } => {
+            serve_http(config, update_notice, &addr, &path, token).await?;
         }
     }
     Ok(())
@@ -123,8 +129,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// `MAIL_MCP_TRANSPORT` selects the transport (`stdio` (default) or `http`).
 /// For `http`, `MAIL_MCP_HTTP_ADDR` (default `127.0.0.1:8080`) and
-/// `MAIL_MCP_HTTP_PATH` (default `/mcp`) configure the listener. An unknown
-/// transport value is a hard error.
+/// `MAIL_MCP_HTTP_PATH` (default `/mcp`) configure the listener, and
+/// `MAIL_MCP_AUTH_TOKEN` (default unset) optionally requires a bearer token on
+/// every request. An unknown transport value is a hard error.
 fn resolve_transport(env_map: &BTreeMap<String, String>) -> Result<TransportMode, String> {
     let mode = env_map
         .get("MAIL_MCP_TRANSPORT")
@@ -134,7 +141,8 @@ fn resolve_transport(env_map: &BTreeMap<String, String>) -> Result<TransportMode
         Some("http") => {
             let addr = env_lookup(env_map, "MAIL_MCP_HTTP_ADDR", DEFAULT_HTTP_ADDR);
             let path = env_lookup(env_map, "MAIL_MCP_HTTP_PATH", DEFAULT_HTTP_PATH);
-            Ok(TransportMode::Http { addr, path })
+            let token = env_optional(env_map, "MAIL_MCP_AUTH_TOKEN");
+            Ok(TransportMode::Http { addr, path, token })
         }
         Some(other) => Err(format!(
             "unknown MAIL_MCP_TRANSPORT '{other}' (expected 'stdio' or 'http')"
@@ -152,16 +160,31 @@ fn env_lookup(env_map: &BTreeMap<String, String>, key: &str, default: &str) -> S
         .to_owned()
 }
 
+/// Fetch a trimmed env value, treating absent and blank alike as unset.
+fn env_optional(env_map: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    env_map
+        .get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Serve the MCP server over streamable HTTP.
 ///
 /// Each MCP session gets its own [`server::MailImapServer`] instance via the
 /// service factory (the server is cheap to construct — it holds `Arc`-wrapped
 /// shared state). Sessions are tracked by an in-memory [`LocalSessionManager`].
+/// When `token` is set, every request must carry a matching
+/// `Authorization: Bearer <token>` header; unauthenticated requests are
+/// rejected before they reach the MCP service, so no session is opened and no
+/// mailbox is touched. When it is unset the endpoint is open to anyone who can
+/// reach the socket — safe only on a trusted network, and startup warns so.
 async fn serve_http(
     config: ServerConfig,
     update_notice: Option<String>,
     addr: &str,
     path: &str,
+    token: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let service = StreamableHttpService::new(
         move || {
@@ -174,12 +197,84 @@ async fn serve_http(
         Default::default(),
     );
 
-    let router = axum::Router::new().nest_service(path, service);
+    let mut router = axum::Router::new().nest_service(path, service);
+    let auth_enabled = token.is_some();
+    if let Some(token) = token {
+        router = router.layer(axum::middleware::from_fn_with_state(
+            Arc::new(token),
+            require_bearer_token,
+        ));
+    } else {
+        tracing::warn!(
+            "MAIL_MCP_AUTH_TOKEN is unset: the HTTP endpoint accepts unauthenticated requests"
+        );
+    }
+
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let bound = listener.local_addr()?;
-    tracing::info!("starting MCP server transport=Http addr={bound} path={path}");
+    tracing::info!(
+        "starting MCP server transport=Http addr={bound} path={path} auth={auth_enabled}"
+    );
     axum::serve(listener, router).await?;
     Ok(())
+}
+
+/// Axum middleware: require `Authorization: Bearer <token>` on every request.
+///
+/// Runs ahead of the MCP service, so a request that fails the check never
+/// reaches session handling. Responds 401 with a `WWW-Authenticate` challenge
+/// and no detail about why — a probe learns only that a token is required.
+async fn require_bearer_token(
+    axum::extract::State(expected): axum::extract::State<Arc<String>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let presented = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+
+    if bearer_matches(presented, &expected) {
+        return next.run(request).await;
+    }
+
+    tracing::warn!("rejected unauthenticated request to the MCP endpoint");
+    (
+        axum::http::StatusCode::UNAUTHORIZED,
+        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
+        "unauthorized\n",
+    )
+        .into_response()
+}
+
+/// Whether an `Authorization` header value carries the expected bearer token.
+///
+/// The scheme is matched case-insensitively (RFC 7235 defines it so); the
+/// token itself is compared byte-exactly, in constant time.
+fn bearer_matches(header: Option<&str>, expected: &str) -> bool {
+    let Some(header) = header else {
+        return false;
+    };
+    let Some((scheme, presented)) = header.trim().split_once(' ') else {
+        return false;
+    };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
+    constant_time_eq(presented.trim().as_bytes(), expected.as_bytes())
+}
+
+/// Byte comparison whose running time does not depend on where the operands
+/// first differ, so a caller cannot recover the token one byte at a time.
+/// Length is not treated as secret (it leaks via the early return).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Check GitHub for newer releases. Returns a notice string if an update is available.
@@ -264,6 +359,7 @@ fn build_help_output(env_map: &BTreeMap<String, String>) -> String {
     out.push_str("  MAIL_MCP_TRANSPORT   (stdio | http, default: stdio)\n");
     out.push_str("  MAIL_MCP_HTTP_ADDR   (http only, default: 127.0.0.1:8080)\n");
     out.push_str("  MAIL_MCP_HTTP_PATH   (http only, default: /mcp)\n");
+    out.push_str("  MAIL_MCP_AUTH_TOKEN  (http only, default: unset = no auth)\n");
     out.push_str(
         "  stdio is spawned by an MCP client; http serves the streamable-HTTP endpoint.\n\n",
     );
@@ -455,9 +551,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        DEFAULT_HTTP_ADDR, DEFAULT_HTTP_PATH, TransportMode, build_help_output,
-        discover_account_sections, env_lookup, is_secret_key, redact_value, resolve_transport,
-        should_print_help,
+        DEFAULT_HTTP_ADDR, DEFAULT_HTTP_PATH, TransportMode, bearer_matches, build_help_output,
+        constant_time_eq, discover_account_sections, env_lookup, is_secret_key, redact_value,
+        resolve_transport, should_print_help,
     };
 
     #[test]
@@ -535,6 +631,7 @@ mod tests {
             TransportMode::Http {
                 addr: DEFAULT_HTTP_ADDR.to_owned(),
                 path: DEFAULT_HTTP_PATH.to_owned(),
+                token: None,
             }
         );
     }
@@ -550,6 +647,7 @@ mod tests {
             TransportMode::Http {
                 addr: "0.0.0.0:9000".to_owned(),
                 path: "/imap".to_owned(),
+                token: None,
             }
         );
     }
@@ -565,11 +663,50 @@ mod tests {
     }
 
     #[test]
+    fn transport_http_reads_auth_token_and_treats_blank_as_unset() {
+        let mut env_map = BTreeMap::new();
+        env_map.insert("MAIL_MCP_TRANSPORT".to_owned(), "http".to_owned());
+        env_map.insert("MAIL_MCP_AUTH_TOKEN".to_owned(), "  s3cret  ".to_owned());
+        match resolve_transport(&env_map).unwrap() {
+            TransportMode::Http { token, .. } => assert_eq!(token.as_deref(), Some("s3cret")),
+            other => panic!("expected http transport, got {other:?}"),
+        }
+
+        env_map.insert("MAIL_MCP_AUTH_TOKEN".to_owned(), "   ".to_owned());
+        match resolve_transport(&env_map).unwrap() {
+            TransportMode::Http { token, .. } => assert_eq!(token, None),
+            other => panic!("expected http transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bearer_matches_accepts_only_the_exact_token() {
+        assert!(bearer_matches(Some("Bearer s3cret"), "s3cret"));
+        assert!(bearer_matches(Some("bearer s3cret"), "s3cret"));
+        assert!(!bearer_matches(Some("Bearer wrong"), "s3cret"));
+        assert!(!bearer_matches(Some("Bearer s3cre"), "s3cret"));
+        assert!(!bearer_matches(Some("Bearer s3cret extra"), "s3cret"));
+        assert!(!bearer_matches(Some("Basic s3cret"), "s3cret"));
+        assert!(!bearer_matches(Some("s3cret"), "s3cret"));
+        assert!(!bearer_matches(None, "s3cret"));
+        assert!(!bearer_matches(Some(""), "s3cret"));
+    }
+
+    #[test]
+    fn constant_time_eq_compares_bytes_exactly() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
     fn help_output_includes_transport_section() {
         let help = build_help_output(&BTreeMap::new());
         assert!(help.contains("Transport selection"));
         assert!(help.contains("MAIL_MCP_TRANSPORT"));
         assert!(help.contains("MAIL_MCP_HTTP_ADDR"));
+        assert!(help.contains("MAIL_MCP_AUTH_TOKEN"));
     }
 
     #[test]

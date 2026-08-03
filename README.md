@@ -445,6 +445,7 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 - **Passwords in SecretString** — never logged or returned in responses
 - **Write operations gated** — require explicit `MAIL_IMAP_WRITE_ENABLED=true`
 - **Send operations gated** — SMTP, EWS, **and Graph** sends all require explicit `MAIL_SMTP_WRITE_ENABLED=true`
+- **HTTP transport authentication** — `MAIL_MCP_AUTH_TOKEN` requires a matching `Authorization: Bearer` header on every request; rejected requests are refused before the MCP service sees them, so no session is opened and no mailbox is touched
 - **Attachment paths restricted** — `file_path` attachments and download `output_dir`s are confined to `MAIL_ATTACHMENT_ALLOWED_DIRS` (defaults to the download dir), with a total-size cap — a prompt-injected model cannot read and exfiltrate arbitrary local files
 - **Delete confirmation** — requires `confirm: true`
 - **HTML sanitized** with ammonia (prevents XSS)
@@ -506,6 +507,15 @@ Use `account_id` in tool calls: `"account_id": "gmail"`, `"account_id": "work"`,
 | `MAIL_EWS_<ID>_CLIENT_SECRET` | No | `none` | Client secret |
 
 > **Tip:** EWS only needs 2 variables (USER + REFRESH_TOKEN). Client ID defaults to Microsoft Office which has all permissions pre-approved.
+
+### Transport
+
+| Variable | Default | Description |
+|---|---|---|
+| `MAIL_MCP_TRANSPORT` | `stdio` | `stdio` (spawned by an MCP client) or `http` (streamable-HTTP endpoint) |
+| `MAIL_MCP_HTTP_ADDR` | `127.0.0.1:8080` | Bind address (http only) |
+| `MAIL_MCP_HTTP_PATH` | `/mcp` | Mount path (http only) |
+| `MAIL_MCP_AUTH_TOKEN` | *(unset)* | Bearer token required on every HTTP request (http only). Unset = no authentication; see Security |
 
 ### Global Settings
 

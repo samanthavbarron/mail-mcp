@@ -89,6 +89,31 @@ path (including Graph) can transmit mail while the switch is off.
 MAIL_SMTP_WRITE_ENABLED=true
 ```
 
+## HTTP Transport Authentication
+
+Over stdio the server is spawned by its MCP client and inherits that trust
+boundary. Over `MAIL_MCP_TRANSPORT=http` it is a network listener, and anything
+able to reach the socket can drive the mailbox. Set `MAIL_MCP_AUTH_TOKEN` to
+require a bearer token on every request:
+
+```bash
+MAIL_MCP_TRANSPORT=http
+MAIL_MCP_AUTH_TOKEN=<a long random string>
+```
+
+Requests must then carry `Authorization: Bearer <token>`. The scheme is matched
+case-insensitively; the token is compared in constant time, so a caller cannot
+recover it byte by byte from response timing. A request that fails the check is
+answered with `401` and a `WWW-Authenticate: Bearer` challenge **before it
+reaches the MCP service** — no session is opened, no IMAP connection is made,
+and the response carries nothing about the server's configuration.
+
+When the variable is unset the endpoint stays open to anyone who can reach it,
+which is only appropriate when the socket itself is the boundary (loopback, or
+a private container network with no published port). Startup logs a warning in
+that case. Network isolation and a token are complementary: the token is what
+still holds if something else lands on that network.
+
 ## Attachment Path Restrictions
 
 Outgoing-mail tools accept attachments either inline (`content_base64`) or by
